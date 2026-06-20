@@ -197,6 +197,20 @@ def get_args_parser():
     return parser
 
 
+def get_attention_pruning_metrics(model):
+    base_model = model.module if hasattr(model, "module") else model
+    base_model = base_model._orig_mod if hasattr(base_model, "_orig_mod") else base_model
+
+    pruned_ratios = []
+    for module in base_model.modules():
+        if hasattr(module, "last_pruned_ratio"):
+            pruned_ratios.append(module.last_pruned_ratio.mean().detach().item())
+
+    avg_pruned_ratio = sum(pruned_ratios) / len(pruned_ratios)
+    
+    return avg_pruned_ratio
+
+
 def main(args):
     utils.init_distributed_mode(args)
 
@@ -339,26 +353,36 @@ def main(args):
         model.load_state_dict(checkpoint_model, strict=False)
         
     if args.attn_only:
-        for name_p,p in model.named_parameters():
-            if '.attn.' in name_p:
-                p.requires_grad = True
-            else:
-                p.requires_grad = False
-        try:
-            model.head.weight.requires_grad = True
-            model.head.bias.requires_grad = True
-        except:
-            model.fc.weight.requires_grad = True
-            model.fc.bias.requires_grad = True
-        try:
-            model.pos_embed.requires_grad = True
-        except:
-            print('no position encoding')
-        try:
-            for p in model.patch_embed.parameters():
-                p.requires_grad = False
-        except:
-            print('no patch embed')
+        # for name_p,p in model.named_parameters():
+        #     if '.attn.' in name_p:
+        #         p.requires_grad = True
+        #     else:
+        #         p.requires_grad = False
+        # try:
+        #     model.head.weight.requires_grad = True
+        #     model.head.bias.requires_grad = True
+        # except:
+        #     model.fc.weight.requires_grad = True
+        #     model.fc.bias.requires_grad = True
+        # try:
+        #     model.pos_embed.requires_grad = True
+        # except:
+        #     print('no position encoding')
+        # try:
+        #     for p in model.patch_embed.parameters():
+        #         p.requires_grad = False
+        # except:
+        #     print('no patch embed')
+
+        # freeze all parameters in the model
+        for p in model.parameters():
+            p.requires_grad = False
+
+        # unfreeze only the MyAttention modules
+        for module in model.modules():
+            if isinstance(module, MyAttention):
+                for p in module.parameters():
+                    p.requires_grad = True
             
     model.to(device)
 
@@ -495,10 +519,13 @@ def main(args):
             
         print(f'Max accuracy: {max_accuracy:.2f}%')
 
+        pruning_ratio = get_attention_pruning_metrics(model)
+
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
                      'epoch': epoch,
-                     'n_parameters': n_parameters}
+                     'n_parameters': n_parameters,
+                     'pruning_ratio': pruning_ratio}
         
         
         # --- SEND STATS TO WANDB ---
