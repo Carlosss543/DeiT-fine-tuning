@@ -194,6 +194,10 @@ def get_args_parser():
     parser.add_argument('--wandb-entity', default=None, type=str, help='W&B username or team name')
     parser.add_argument('--wandb-run-name', default='', type=str, help='Specific name for this run (optional)')
 
+    # arguments for progressively unfreezing parameters
+    parser.add_argument('--unfreeze-attn-epoch', default=0, type=int, help='Epoch from which all attention (qkv, proj, bias) becomes trainable. Before this epoch, only the bias (attn.b) is trainable.')
+    parser.add_argument('--unfreeze-mlp-epoch', default=0, type=int, help='Epoch from which all other parameters (MLPs, norms, patch embed, head) become trainable.')
+
     return parser
 
 
@@ -209,6 +213,32 @@ def get_attention_pruning_metrics(model):
     avg_pruned_ratio = sum(pruned_ratios) / len(pruned_ratios)
     
     return avg_pruned_ratio
+
+
+def set_trainable_stage(model, epoch, unfreeze_attn_epoch, unfreeze_mlp_epoch):
+    """
+    epoch < unfreeze_attn_epoch                         -> seul attn.b est entraînable
+    unfreeze_attn_epoch <= epoch < unfreeze_mlp_epoch    -> toute l'attention (qkv, proj, q_norm, k_norm, b)
+    epoch >= unfreeze_mlp_epoch                          -> tout le modèle (full fine-tuning)
+    """
+    if epoch >= unfreeze_mlp_epoch:
+        for p in model.parameters():
+            p.requires_grad = True
+        return
+
+    for p in model.parameters():
+        p.requires_grad = False
+
+    if epoch >= unfreeze_attn_epoch:
+        for module in model.modules():
+            if isinstance(module, MyAttention):
+                for p in module.parameters():
+                    p.requires_grad = True
+    else:
+        for module in model.modules():
+            if isinstance(module, MyAttention) and module.b is not None:
+                for p in module.b.parameters():
+                    p.requires_grad = True
 
 
 def main(args):
@@ -352,37 +382,42 @@ def main(args):
 
         model.load_state_dict(checkpoint_model, strict=False)
         
-    if args.attn_only:
-        # for name_p,p in model.named_parameters():
-        #     if '.attn.' in name_p:
-        #         p.requires_grad = True
-        #     else:
-        #         p.requires_grad = False
-        # try:
-        #     model.head.weight.requires_grad = True
-        #     model.head.bias.requires_grad = True
-        # except:
-        #     model.fc.weight.requires_grad = True
-        #     model.fc.bias.requires_grad = True
-        # try:
-        #     model.pos_embed.requires_grad = True
-        # except:
-        #     print('no position encoding')
-        # try:
-        #     for p in model.patch_embed.parameters():
-        #         p.requires_grad = False
-        # except:
-        #     print('no patch embed')
+    # if args.attn_only:
+    #     # for name_p,p in model.named_parameters():
+    #     #     if '.attn.' in name_p:
+    #     #         p.requires_grad = True
+    #     #     else:
+    #     #         p.requires_grad = False
+    #     # try:
+    #     #     model.head.weight.requires_grad = True
+    #     #     model.head.bias.requires_grad = True
+    #     # except:
+    #     #     model.fc.weight.requires_grad = True
+    #     #     model.fc.bias.requires_grad = True
+    #     # try:
+    #     #     model.pos_embed.requires_grad = True
+    #     # except:
+    #     #     print('no position encoding')
+    #     # try:
+    #     #     for p in model.patch_embed.parameters():
+    #     #         p.requires_grad = False
+    #     # except:
+    #     #     print('no patch embed')
 
-        # freeze all parameters in the model
-        for p in model.parameters():
-            p.requires_grad = False
+    #     # freeze all parameters in the model
+    #     for p in model.parameters():
+    #         p.requires_grad = False
 
-        # unfreeze only the MyAttention modules
-        for module in model.modules():
-            if isinstance(module, MyAttention):
-                for p in module.parameters():
-                    p.requires_grad = True
+    #     # unfreeze only the MyAttention modules
+    #     for module in model.modules():
+    #         if isinstance(module, MyAttention):
+    #             for p in module.parameters():
+    #                 p.requires_grad = True
+
+    # unfreeze parameters based on the current epoch and the specified unfreeze epochs
+    set_trainable_stage(model, args.start_epoch, args.unfreeze_attn_epoch, args.unfreeze_mlp_epoch)
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Stage initial (epoch {args.start_epoch}) : {n_trainable} paramètres entraînables")
             
     model.to(device)
 
@@ -397,7 +432,7 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
@@ -473,6 +508,21 @@ def main(args):
     start_time = time.time()
     max_accuracy = 0.0
     for epoch in range(args.start_epoch, args.epochs):
+        # --- UNFREEZE PARAMETERS BASED ON EPOCH ---
+        if epoch == args.unfreeze_attn_epoch or epoch == args.unfreeze_mlp_epoch:
+            set_trainable_stage(model_without_ddp, epoch, args.unfreeze_attn_epoch, args.unfreeze_mlp_epoch)
+            if args.distributed:
+                # Important: the gradient synchronization hooks of DDP are frozen at construction time.
+                # Without reconstructing the wrapper, newly unfrozen parameters would never be synchronized across GPUs.
+                model = torch.nn.parallel.DistributedDataParallel(
+                    model_without_ddp, device_ids=[args.gpu], find_unused_parameters=True
+                )
+            n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"[epoch {epoch}] changement de stage -> {n_trainable} paramètres entraînables")
+            optimizer = create_optimizer(args, model_without_ddp)
+            lr_scheduler, _ = create_scheduler(args, optimizer)
+            lr_scheduler.step(epoch)
+
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
@@ -484,7 +534,8 @@ def main(args):
             args = args,
         )
 
-        lr_scheduler.step(epoch)
+        lr_scheduler.step(epoch+1)
+
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
             for checkpoint_path in checkpoint_paths:
@@ -524,7 +575,7 @@ def main(args):
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
                      'epoch': epoch,
-                     'n_parameters': n_parameters,
+                     'n_parameters': sum(p.numel() for p in model.parameters() if p.requires_grad),
                      'pruning_ratio': pruning_ratio}
         
         
